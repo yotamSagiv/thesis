@@ -7,7 +7,7 @@ import sys
 from random import randint
 from scipy.special import expit
 from sklearn.linear_model import LogisticRegression
-# import statsmodels.api as sm
+import statsmodels.api as sm
 
 import rpy2
 import rpy2.robjects as robjects
@@ -114,9 +114,11 @@ def get_reward(num_tasks, t, is_tensor, true_params):
 # expected discounted reward over the experiment time window
 # gamma is discount factor
 def expected_discounted_reward(b0, b1, V, P, gamma, t_0, T, max_tasks, task_dist):
+	DISCOUNT_SCALE_FACTOR = 0.025
 	s = 0
-	for t in range(t_0, T + 1): 
-		s += (gamma ** (t - t_0)) * expected_trial_reward(b0, b1, V, P, t, max_tasks, task_dist)
+	for t in np.arange(t_0, T + 1): 
+		discount_factor = gamma ** ((t - t_0) * DISCOUNT_SCALE_FACTOR)
+		s += (discount_factor * expected_trial_reward(b0, b1, V, P, t, max_tasks, task_dist))
 	
 	return s
 
@@ -164,6 +166,8 @@ def pick_action(basis_val, tensor_val, params, algorithm="softmax"):
 		eps = params
 		if np.random.uniform(0, 1) < eps:
 			choice = np.random.choice(2)
+		elif basis_val == tensor_val:
+			choice = np.random.choice(2)
 		elif basis_val > tensor_val:
 			choice = 0
 		else:
@@ -191,14 +195,15 @@ true_V = 1                        # reward for correctness
 true_P = float(sys.argv[1])       # punishment for time delay
 prop_mt = float(sys.argv[2])      # proportion of multitasking trials
 gamma = float(sys.argv[3])        # reward discount factor
-epsilon = 0.2                     # parameter for epsilon greedy algorithm
+epsilon = 0.1                     # parameter for epsilon greedy algorithm
+delta = 0                         # generalization parameter
 
 # training parameters
-basis_true_k = 0.1                                 # logistic training gradient
+basis_true_k = 0.01                                # logistic training gradient
 basis_true_m = num_trials * float(sys.argv[4])     # logistic training midpoint
 basis_true_b0, basis_true_b1 = km_to_b0b1(basis_true_k, basis_true_m) # translate gradient/midpoint to linear parameters
 
-tensor_true_k = 0.1                                # logistic training gradient
+tensor_true_k = 0.01                               # logistic training gradient
 tensor_true_m = num_trials * float(sys.argv[5])    # logistic training midpoint
 tensor_true_b0, tensor_true_b1 = km_to_b0b1(tensor_true_k, tensor_true_m) # translate gradient/midpoint to linear parameters
 
@@ -258,9 +263,13 @@ basis_val = 0
 tensor_val = 0
 
 basis_pick_count = 2
+basis_generalization_count = 0
 tensor_pick_count = 2
+tensor_generalization_count = 0
 
 # simulation loop
+choices = []
+
 for t in np.arange(2, num_trials):
 	# pick number of tasks
 	num_tasks = np.random.choice(np.arange(1, max_tasks + 1), p=true_tasks)
@@ -268,35 +277,37 @@ for t in np.arange(2, num_trials):
 
 	# pick representation according to softmax over values
 	is_tensor = (pick_action(basis_val, tensor_val, params=epsilon, algorithm="e-greedy") == 1) # pick_action returns 1 for tensor
-
+	choices.append(is_tensor)
 	# get reward for all tasks
 	if is_tensor:
-		trial_R, trial_T = get_reward(num_tasks, tensor_pick_count, is_tensor, tensor_true_params)
+		trial_R, trial_T = get_reward(num_tasks, tensor_pick_count + tensor_generalization_count, is_tensor, tensor_true_params)
 		
 		# add data to success history
 		for i in range(len(trial_T)):
-			t_X.append(tensor_pick_count)
+			t_X.append(tensor_pick_count + tensor_generalization_count)
 			t_Y.append(1)
 
 		for i in range(num_tasks - len(trial_T)):
-			t_X.append(tensor_pick_count)
+			t_X.append(tensor_pick_count + tensor_generalization_count)
 			t_Y.append(0)
 
 		tensor_pick_count += 1
+		basis_pick_count += delta
 
 	else:
-		trial_R, trial_T = get_reward(num_tasks, basis_pick_count, is_tensor, basis_true_params)
+		trial_R, trial_T = get_reward(num_tasks, basis_pick_count + basis_generalization_count, is_tensor, basis_true_params)
 
 		# add data to success history
 		for i in range(len(trial_T)):
-			b_X.append(basis_pick_count)
+			b_X.append(basis_pick_count + basis_generalization_count)
 			b_Y.append(1)
 
 		for i in range(num_tasks - len(trial_T)):
-			b_X.append(basis_pick_count)
+			b_X.append(basis_pick_count + basis_generalization_count)
 			b_Y.append(0)
 
 		basis_pick_count += 1
+		tensor_pick_count += delta
 
 	# add data to reward history
 	R += trial_R
@@ -330,19 +341,10 @@ for t in np.arange(2, num_trials):
 	infer_task_dist = sample_multinomial(task_counts, prior_alpha)
 
 	# recompute expected basis discounted reward values
-	basis_val = float(expected_discounted_reward(b_reg.rx2('coefficients')[0], b_reg.rx2('coefficients')[1], infer_V, infer_P, gamma, basis_pick_count, num_trials - tensor_pick_count, max_tasks, infer_task_dist))
+	basis_val = float(expected_discounted_reward(b_reg.rx2('coefficients')[0], b_reg.rx2('coefficients')[1], infer_V, infer_P, gamma, basis_pick_count + basis_generalization_count, num_trials - tensor_pick_count + basis_generalization_count, max_tasks, infer_task_dist))
 	
 	# recompute expected tensor reward value -- infer_P = 0 since you're parallelizing the execution
-	tensor_val = float(expected_discounted_reward(t_reg.rx2('coefficients')[0], t_reg.rx2('coefficients')[1], infer_V, 0, gamma, tensor_pick_count, num_trials - basis_pick_count, max_tasks, infer_task_dist))
-
-	# woo, logging.
-	# print("Iteration %d:\n" % t)
-	# print("V = %f\nP = %f\n" % (infer_V, infer_P))
-
-	# b_k, b_m = b0b1_to_km(b_reg.rx2('coefficients')[0], b_reg.rx2('coefficients')[1])
-	# t_k, t_m = b0b1_to_km(t_reg.rx2('coefficients')[0], t_reg.rx2('coefficients')[1])
-
-	# print("Tensor pick count: %d\nTensor value: %f\nTensor logistic params: (%f, %f)\nTruth: (%f, %f)\n" % (tensor_pick_count, tensor_val, t_reg.rx2('coefficients')[0], t_reg.rx2('coefficients')[1], tensor_true_b0, tensor_true_b1))
-	# print("Basis pick count: %d\nBasis value: %f\nBasis logistic params: (%f, %f)\nTruth: (%f, %f)\n" % (basis_pick_count, basis_val, b_reg.rx2('coefficients')[0], b_reg.rx2('coefficients')[1], basis_true_b0, basis_true_b1))
+	tensor_val = float(expected_discounted_reward(t_reg.rx2('coefficients')[0], t_reg.rx2('coefficients')[1], infer_V, 0, gamma, tensor_pick_count + tensor_generalization_count, num_trials - basis_pick_count + tensor_generalization_count, max_tasks, infer_task_dist))
 
 print("%d,%d" % (tensor_pick_count, basis_pick_count))
+print(choices)

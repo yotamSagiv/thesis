@@ -7,12 +7,7 @@ import sys
 from random import randint
 from scipy.special import expit
 from sklearn.linear_model import LogisticRegression
-# import statsmodels.api as sm
-
-import rpy2
-import rpy2.robjects as robjects
-from rpy2.robjects.packages import importr
-from rpy2.robjects import FloatVector
+import statsmodels.api as sm
 
 ######### V, P SAMPLING FUNCTIONS
 
@@ -31,47 +26,6 @@ def sample_vp(R, T, prior_params):
 
 	return samples[-1, :]
 
-# it's convention to provide the bayesian terms as a logarithm, apparently...
-# computes the log-prior on mu_V, mu_T given optional prior parameters
-def lnprior(theta, prior_params):
-	v_prior_mean, v_prior_var, p_prior_mean, p_prior_var = prior_params
-	v, p = theta
-	vp_t1 = math.log(1 / math.sqrt(2 * math.pi * v_prior_var))
-	vp_t2 = (v - v_prior_mean)**2
-	vp_t2 /= (2 * v_prior_var)
-	vp = vp_t1 - vp_t2
-
-	pp_t1 = math.log(1 / math.sqrt(2 * math.pi * p_prior_var)) # if i were smart, i'd define a log-Gauss function...
-	pp_t2 = (p - p_prior_mean)**2
-	pp_t2 /= (2 * p_prior_var)
-	pp = pp_t1 - pp_t2
-
-	return vp + pp
-
-# see comment on lnprior...
-# computes the log-likelihood for given mu_V, mu_T given data (R, T)
-def lnlike(theta, R, T):
-	v, p = theta
-	s = 0
-	for i in range(R.shape[0]):
-		like_var = 1 + (T[i, 0] ** 2) # if V ~ N(mu_V, 1), P ~ N(mu_P, 1), then V - tP is distributed
-									  # according to N(mu_V - tmu_P, 1 + t^2)
-		like_mean = v - (T[i, 0] * p)
-
-		const_factor = math.log(1 / math.sqrt(2 * math.pi * like_var))
-		exp_factor = (R[i, 0] - like_mean) ** 2
-		exp_factor /= (2 * like_var)
-
-		s += const_factor - exp_factor
-
-	return s
-
-# computes log of prior-likelihood product
-def lnprob(theta, R, T, prior_params):
-	lp = lnprior(theta, prior_params)
-	ll = lnlike(theta, R, T)
-	return lp + ll
-
 ######### PROPMT SAMPLING FUNCTIONS
 
 # sample a multinomial task distribution for the number of tasks
@@ -81,11 +35,35 @@ def sample_multinomial(counts, prior_alpha):
 
 ######### P(SUCCESS) SAMPLING FUNCTIONS
 
-# given a list of prior means and inverse prior covariances, return parameters for logistic regression
-# on the data (X, Y)
-def sample_b0b1(X, Y, prior_means, prior_Hessians):
-	w_fit_MAP, H_posterior = bl.fit_bayes_logistic(Y, X, prior_means, prior_Hessians)
-	return w_fit_MAP
+# run weighted least squares on predictors X for Y
+def infer_wls_params(X, Y, has_intercept = True, eta=0.2):
+	weights = []
+	for i in range(len(X)):
+		weights.insert(0, eta * ((1 - eta) ** i))
+
+	if has_intercept:
+		X = sm.add_constant(X, has_constant='add')
+
+	wls_model = sm.WLS(Y, X, weights = weights)
+	results = wls_model.fit()
+
+	if has_intercept:
+		return results.params[0], results.params[1]
+	else:
+		return 0, results.params[0]
+
+def infer_ols_params(X, Y, has_intercept = True, eta=None):
+	if has_intercept:
+		X = sm.add_constant(X, has_constant='add')
+
+	ols_model = sm.OLS(Y, X)
+	results = ols_model.fit()
+
+	if has_intercept:
+		return results.params[0], results.params[1]
+	else:
+		return 0, results.params[0]
+
 
 ######### DATA PROCESSING FUNCTIONS
 
@@ -113,19 +91,21 @@ def get_reward(num_tasks, t, is_tensor, true_params):
 
 # expected discounted reward over the experiment time window
 # gamma is discount factor
-def expected_discounted_reward(b0, b1, V, P, gamma, t_0, T, max_tasks, task_dist):
+def expected_discounted_reward(grad, intercept, V, P, gamma, t_0, T, max_tasks, task_dist):
+	DISCOUNT_SCALE_FACTOR = 0.025
 	s = 0
 	for t in range(t_0, T + 1): 
-		s += (gamma ** (t - t_0)) * expected_trial_reward(b0, b1, V, P, t, max_tasks, task_dist)
+		discount_factor = gamma ** ((t - t_0) * DISCOUNT_SCALE_FACTOR)
+		s += (discount_factor * expected_trial_reward(grad, intercept, V, P, t, max_tasks, task_dist))
 	
 	return s
 
 # expected reward on a particular trial
-def expected_trial_reward(b0, b1, V, P, t, max_tasks, task_dist):
+def expected_trial_reward(grad, intercept, V, P, t, max_tasks, task_dist):
 	s = 0
 	for i in np.arange(1, max_tasks + 1):
 		prob_task = task_dist[i - 1]
-		prob_success = lin_logistic(t, b1, b0)
+		prob_success = lin(grad, t, intercept)
 		num_terms = i / 2
 		sum_term = (2 * V) - ((i - 1) * P)
 
@@ -151,6 +131,16 @@ def km_to_b0b1(k, m):
 def b0b1_to_km(b0, b1):
 	return (b1, -b0 / b1)
 
+def lin(grad, t, intercept=0):
+	val = intercept + (grad * t)
+
+	if val >= 1:
+		val = 1
+	if val <= 0:
+		val = 0
+
+	return val
+
 # using softmax, pick an action
 def pick_action(basis_val, tensor_val, params, algorithm="softmax"): 
 	if algorithm == "softmax":
@@ -162,7 +152,7 @@ def pick_action(basis_val, tensor_val, params, algorithm="softmax"):
 		choice = np.random.choice(2, p=dist)
 	else:
 		eps = params
-		if np.random.uniform(0, 1) < eps:
+		if np.random.uniform(0, 1) < eps or tensor_val == basis_val:
 			choice = np.random.choice(2)
 		elif basis_val > tensor_val:
 			choice = 0
@@ -191,14 +181,15 @@ true_V = 1                        # reward for correctness
 true_P = float(sys.argv[1])       # punishment for time delay
 prop_mt = float(sys.argv[2])      # proportion of multitasking trials
 gamma = float(sys.argv[3])        # reward discount factor
-epsilon = 0.2                     # parameter for epsilon greedy algorithm
+epsilon = 0.1                     # parameter for epsilon greedy algorithm
+eta = 0.5                         # recency weighting parameter
 
-# training parameters
-basis_true_k = 0.1                                 # logistic training gradient
+# training parameters 
+basis_true_k = 0.02                                # logistic training gradient
 basis_true_m = num_trials * float(sys.argv[4])     # logistic training midpoint
 basis_true_b0, basis_true_b1 = km_to_b0b1(basis_true_k, basis_true_m) # translate gradient/midpoint to linear parameters
 
-tensor_true_k = 0.1                                # logistic training gradient
+tensor_true_k = 0.02                               # logistic training gradient
 tensor_true_m = num_trials * float(sys.argv[5])    # logistic training midpoint
 tensor_true_b0, tensor_true_b1 = km_to_b0b1(tensor_true_k, tensor_true_m) # translate gradient/midpoint to linear parameters
 
@@ -217,23 +208,6 @@ tensor_true_params = (true_V, 0, tensor_true_b0, tensor_true_b1)
 # Dirichlet parameter
 prior_alpha = np.ones((max_tasks,)) # uniform
 
-# Logistic regression parameters, basis
-prior_midpoint = num_trials / 2
-prior_gradient = 0.1
-basis_logistic_prior_means = np.array(km_to_b0b1(prior_gradient, prior_midpoint))
-basis_logistic_prior_Hessian = np.ones((2,)) * 0.001 # very uncertain
-
-# Logistic regression parameters, tensor
-prior_midpoint = num_trials / 2
-prior_gradient = 0.1
-tensor_logistic_prior_means = np.array(km_to_b0b1(prior_gradient, prior_midpoint))
-tensor_logistic_prior_Hessian = np.ones((2,)) * 0.001 # very uncertain
-
-# rpy2 setup
-base = importr('base')
-utils = importr('utils')
-arm = importr('arm')
-
 # Reward inference parameters
 v_prior_mean = true_V
 v_prior_var = 0.1
@@ -244,30 +218,32 @@ p_prior_var = 0.001
 vp_prior_params = (v_prior_mean, v_prior_var, p_prior_mean, p_prior_var)
 
 # simulation setup
-R = [true_V, true_V] # list of accumulated rewards
-T = [0, 0] # list of timesteps at which rewards were accumulated
-b_X = [num_trials - 1, 0]  # list of times
-b_Y = [1, 0]  # list of successes at those times
-t_X = [num_trials - 1, 0]  # list of times
-t_Y = [1, 0]  # list of successes at those times
+R = []    # list of accumulated rewards
+T = []    # list of timesteps at which rewards were accumulated
+b_X = []  # list of times
+b_Y = []  # list of successes at those times
+t_X = []  # list of times
+t_Y = []  # list of successes at those times
 task_counts = np.zeros((max_tasks,)) # list of tasks sampled
-task_counts[0] = 4
 
 # initial representation reward values
 basis_val = 0
 tensor_val = 0
 
-basis_pick_count = 2
-tensor_pick_count = 2
+basis_pick_count = 0
+tensor_pick_count = 0
 
 # simulation loop
-for t in np.arange(2, num_trials):
+choices = []
+
+for t in np.arange(0, num_trials):
 	# pick number of tasks
 	num_tasks = np.random.choice(np.arange(1, max_tasks + 1), p=true_tasks)
 	task_counts[num_tasks - 1] += 1
 
 	# pick representation according to softmax over values
 	is_tensor = (pick_action(basis_val, tensor_val, params=epsilon, algorithm="e-greedy") == 1) # pick_action returns 1 for tensor
+	choices.append(is_tensor)
 
 	# get reward for all tasks
 	if is_tensor:
@@ -308,41 +284,30 @@ for t in np.arange(2, num_trials):
 	infer_P = true_P
 
 	# infer logistic training curve parameters based off of success	
-	b_X_rpy2 = FloatVector(b_X).r_repr()
-	b_Y_rpy2 = FloatVector(b_Y).r_repr()
-	robjects.r('''
-		b_data = data.frame(%s, cbind(%s, 1 - %s))
-		b_reg = bayesglm((cbind(%s, 1-%s)) ~ %s, b_data, family="binomial", prior.mean = %f, prior.mean.for.intercept = %f)
-		''' % (b_X_rpy2, b_Y_rpy2, b_Y_rpy2, b_Y_rpy2, b_Y_rpy2, b_X_rpy2, basis_true_b1, basis_true_b0))
-
-	b_reg = robjects.r['b_reg']
-
-	t_X_rpy2 = FloatVector(t_X).r_repr()
-	t_Y_rpy2 = FloatVector(t_Y).r_repr()
-	robjects.r('''
-		t_data = data.frame(%s, cbind(%s, 1 - %s))
-		t_reg = bayesglm((cbind(%s, 1-%s)) ~ %s, t_data, family="binomial", prior.mean = %f, prior.mean.for.intercept = %f)
-		''' % (t_X_rpy2, t_Y_rpy2, t_Y_rpy2, t_Y_rpy2, t_Y_rpy2, t_X_rpy2, tensor_true_b1, tensor_true_b0))
-
-	t_reg = robjects.r['t_reg']
+	if b_X:
+		basis_intercept, basis_grad = infer_ols_params(b_X, b_Y, has_intercept = False, eta = eta)
+	if t_X:
+		tensor_intercept, tensor_grad = infer_ols_params(t_X, t_Y, has_intercept = False, eta = eta)
 
 	# infer task distribution based off of num_tasks
 	infer_task_dist = sample_multinomial(task_counts, prior_alpha)
 
 	# recompute expected basis discounted reward values
-	basis_val = float(expected_discounted_reward(b_reg.rx2('coefficients')[0], b_reg.rx2('coefficients')[1], infer_V, infer_P, gamma, basis_pick_count, num_trials - tensor_pick_count, max_tasks, infer_task_dist))
+	if b_X:
+		basis_val = float(expected_discounted_reward(basis_grad, basis_intercept, infer_V, infer_P, gamma, basis_pick_count, num_trials - tensor_pick_count, max_tasks, infer_task_dist))
 	
 	# recompute expected tensor reward value -- infer_P = 0 since you're parallelizing the execution
-	tensor_val = float(expected_discounted_reward(t_reg.rx2('coefficients')[0], t_reg.rx2('coefficients')[1], infer_V, 0, gamma, tensor_pick_count, num_trials - basis_pick_count, max_tasks, infer_task_dist))
+	if t_X:
+		tensor_val = float(expected_discounted_reward(tensor_grad, tensor_intercept, infer_V, 0, gamma, tensor_pick_count, num_trials - basis_pick_count, max_tasks, infer_task_dist))
 
 	# woo, logging.
 	# print("Iteration %d:\n" % t)
 	# print("V = %f\nP = %f\n" % (infer_V, infer_P))
 
-	# b_k, b_m = b0b1_to_km(b_reg.rx2('coefficients')[0], b_reg.rx2('coefficients')[1])
-	# t_k, t_m = b0b1_to_km(t_reg.rx2('coefficients')[0], t_reg.rx2('coefficients')[1])
-
-	# print("Tensor pick count: %d\nTensor value: %f\nTensor logistic params: (%f, %f)\nTruth: (%f, %f)\n" % (tensor_pick_count, tensor_val, t_reg.rx2('coefficients')[0], t_reg.rx2('coefficients')[1], tensor_true_b0, tensor_true_b1))
-	# print("Basis pick count: %d\nBasis value: %f\nBasis logistic params: (%f, %f)\nTruth: (%f, %f)\n" % (basis_pick_count, basis_val, b_reg.rx2('coefficients')[0], b_reg.rx2('coefficients')[1], basis_true_b0, basis_true_b1))
+	# if t_X:
+	# 	print("Tensor pick count: %d\nTensor value: %f\nTensor linear params: (%f, %f)\nTruth: (%f, %f)\n" % (tensor_pick_count, tensor_val, tensor_intercept, tensor_grad, tensor_true_b0, tensor_true_b1))
+	# if b_X:
+	# 	print("Basis pick count: %d\nBasis value: %f\nBasis linear params: (%f, %f)\nTruth: (%f, %f)\n" % (basis_pick_count, basis_val, basis_intercept, basis_grad, basis_true_b0, basis_true_b1))
 
 print("%d,%d" % (tensor_pick_count, basis_pick_count))
+print(choices)

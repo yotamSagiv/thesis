@@ -7,85 +7,12 @@ import sys
 from random import randint
 from scipy.special import expit
 from sklearn.linear_model import LogisticRegression
-# import statsmodels.api as sm
+import statsmodels.api as sm
 
 import rpy2
 import rpy2.robjects as robjects
 from rpy2.robjects.packages import importr
 from rpy2.robjects import FloatVector
-
-######### V, P SAMPLING FUNCTIONS
-
-# sample v and p values from the posterior
-def sample_vp(R, T, prior_params):
-	burn_in = 100
-	sample_iterations = 500
-
-	ndim = 2
-	nwalkers = 50
-	pos = [np.random.randn(ndim) for i in range(nwalkers)]
-
-	sampler = mc.EnsembleSampler(nwalkers, ndim, lnprob, args=(R, T, prior_params))
-	sampler.run_mcmc(pos, sample_iterations)
-	samples = sampler.chain[:, burn_in:, :].reshape((-1, ndim))
-
-	return samples[-1, :]
-
-# it's convention to provide the bayesian terms as a logarithm, apparently...
-# computes the log-prior on mu_V, mu_T given optional prior parameters
-def lnprior(theta, prior_params):
-	v_prior_mean, v_prior_var, p_prior_mean, p_prior_var = prior_params
-	v, p = theta
-	vp_t1 = math.log(1 / math.sqrt(2 * math.pi * v_prior_var))
-	vp_t2 = (v - v_prior_mean)**2
-	vp_t2 /= (2 * v_prior_var)
-	vp = vp_t1 - vp_t2
-
-	pp_t1 = math.log(1 / math.sqrt(2 * math.pi * p_prior_var)) # if i were smart, i'd define a log-Gauss function...
-	pp_t2 = (p - p_prior_mean)**2
-	pp_t2 /= (2 * p_prior_var)
-	pp = pp_t1 - pp_t2
-
-	return vp + pp
-
-# see comment on lnprior...
-# computes the log-likelihood for given mu_V, mu_T given data (R, T)
-def lnlike(theta, R, T):
-	v, p = theta
-	s = 0
-	for i in range(R.shape[0]):
-		like_var = 1 + (T[i, 0] ** 2) # if V ~ N(mu_V, 1), P ~ N(mu_P, 1), then V - tP is distributed
-									  # according to N(mu_V - tmu_P, 1 + t^2)
-		like_mean = v - (T[i, 0] * p)
-
-		const_factor = math.log(1 / math.sqrt(2 * math.pi * like_var))
-		exp_factor = (R[i, 0] - like_mean) ** 2
-		exp_factor /= (2 * like_var)
-
-		s += const_factor - exp_factor
-
-	return s
-
-# computes log of prior-likelihood product
-def lnprob(theta, R, T, prior_params):
-	lp = lnprior(theta, prior_params)
-	ll = lnlike(theta, R, T)
-	return lp + ll
-
-######### PROPMT SAMPLING FUNCTIONS
-
-# sample a multinomial task distribution for the number of tasks
-def sample_multinomial(counts, prior_alpha):
-	multinom = np.random.dirichlet(counts + prior_alpha)
-	return multinom
-
-######### P(SUCCESS) SAMPLING FUNCTIONS
-
-# given a list of prior means and inverse prior covariances, return parameters for logistic regression
-# on the data (X, Y)
-def sample_b0b1(X, Y, prior_means, prior_Hessians):
-	w_fit_MAP, H_posterior = bl.fit_bayes_logistic(Y, X, prior_means, prior_Hessians)
-	return w_fit_MAP
 
 ######### DATA PROCESSING FUNCTIONS
 
@@ -114,9 +41,11 @@ def get_reward(num_tasks, t, is_tensor, true_params):
 # expected discounted reward over the experiment time window
 # gamma is discount factor
 def expected_discounted_reward(b0, b1, V, P, gamma, t_0, T, max_tasks, task_dist):
+	DISCOUNT_SCALE_FACTOR = 0.025
 	s = 0
 	for t in range(t_0, T + 1): 
-		s += (gamma ** (t - t_0)) * expected_trial_reward(b0, b1, V, P, t, max_tasks, task_dist)
+		discount_factor = gamma ** ((t - t_0) * DISCOUNT_SCALE_FACTOR)
+		s += (discount_factor * expected_trial_reward(b0, b1, V, P, t, max_tasks, task_dist))
 	
 	return s
 
@@ -191,23 +120,27 @@ true_V = 1                        # reward for correctness
 true_P = float(sys.argv[1])       # punishment for time delay
 prop_mt = float(sys.argv[2])      # proportion of multitasking trials
 gamma = float(sys.argv[3])        # reward discount factor
-epsilon = 0.2                     # parameter for epsilon greedy algorithm
+epsilon = 0.1                     # parameter for epsilon greedy algorithm
 
 # training parameters
-basis_true_k = 0.1                                 # logistic training gradient
+basis_true_k = 0.01                                # logistic training gradient
 basis_true_m = num_trials * float(sys.argv[4])     # logistic training midpoint
 basis_true_b0, basis_true_b1 = km_to_b0b1(basis_true_k, basis_true_m) # translate gradient/midpoint to linear parameters
 
-tensor_true_k = 0.1                                # logistic training gradient
+tensor_true_k = 0.01                               # logistic training gradient
 tensor_true_m = num_trials * float(sys.argv[5])    # logistic training midpoint
 tensor_true_b0, tensor_true_b1 = km_to_b0b1(tensor_true_k, tensor_true_m) # translate gradient/midpoint to linear parameters
 
 true_tasks = np.zeros((max_tasks,)) # true task distribution
 for i in range(max_tasks):
-	if i == 0:
-		true_tasks[i] = 1 - prop_mt
+	# if i == 0:
+	# 	true_tasks[i] = 1 - prop_mt
+	# else:
+	# 	true_tasks[i] = prop_mt / (max_tasks - 1)
+	if i == 2:
+		true_tasks[i] = 1
 	else:
-		true_tasks[i] = prop_mt / (max_tasks - 1)
+		true_tasks[i] = 0
 
 basis_true_params = (true_V, true_P, basis_true_b0, basis_true_b1)
 tensor_true_params = (true_V, 0, tensor_true_b0, tensor_true_b1)
@@ -234,15 +167,6 @@ base = importr('base')
 utils = importr('utils')
 arm = importr('arm')
 
-# Reward inference parameters
-v_prior_mean = true_V
-v_prior_var = 0.1
-
-p_prior_mean = true_P
-p_prior_var = 0.001
-
-vp_prior_params = (v_prior_mean, v_prior_var, p_prior_mean, p_prior_var)
-
 # simulation setup
 R = [true_V, true_V] # list of accumulated rewards
 T = [0, 0] # list of timesteps at which rewards were accumulated
@@ -264,7 +188,6 @@ tensor_pick_count = 2
 for t in np.arange(2, num_trials):
 	# pick number of tasks
 	num_tasks = np.random.choice(np.arange(1, max_tasks + 1), p=true_tasks)
-	task_counts[num_tasks - 1] += 1
 
 	# pick representation according to softmax over values
 	is_tensor = (pick_action(basis_val, tensor_val, params=epsilon, algorithm="e-greedy") == 1) # pick_action returns 1 for tensor
@@ -327,14 +250,21 @@ for t in np.arange(2, num_trials):
 	t_reg = robjects.r['t_reg']
 
 	# infer task distribution based off of num_tasks
-	infer_task_dist = sample_multinomial(task_counts, prior_alpha)
+	infer_task_dist = true_tasks
 
 	# recompute expected basis discounted reward values
 	basis_val = float(expected_discounted_reward(b_reg.rx2('coefficients')[0], b_reg.rx2('coefficients')[1], infer_V, infer_P, gamma, basis_pick_count, num_trials - tensor_pick_count, max_tasks, infer_task_dist))
+	# basis_val = float(expected_discounted_reward(basis_true_b0, basis_true_b1, infer_V, infer_P, gamma, basis_pick_count, num_trials - tensor_pick_count, max_tasks, infer_task_dist))
 	
+
 	# recompute expected tensor reward value -- infer_P = 0 since you're parallelizing the execution
 	tensor_val = float(expected_discounted_reward(t_reg.rx2('coefficients')[0], t_reg.rx2('coefficients')[1], infer_V, 0, gamma, tensor_pick_count, num_trials - basis_pick_count, max_tasks, infer_task_dist))
+	# tensor_val = float(expected_discounted_reward(tensor_true_b0, tensor_true_b1, infer_V, 0, gamma, tensor_pick_count, num_trials - basis_pick_count, max_tasks, infer_task_dist))
 
+	# print('basis_val = %f' % basis_val)
+	# print('tensor_val = %f' % tensor_val)
+
+	# sys.exit()
 	# woo, logging.
 	# print("Iteration %d:\n" % t)
 	# print("V = %f\nP = %f\n" % (infer_V, infer_P))
