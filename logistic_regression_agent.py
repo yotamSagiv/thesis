@@ -342,9 +342,11 @@ for t in np.arange(2, num_trials):
 
 	# recompute expected basis discounted reward values
 	basis_val = float(expected_discounted_reward(b_reg.rx2('coefficients')[0], b_reg.rx2('coefficients')[1], infer_V, infer_P, gamma, basis_pick_count + basis_generalization_count, num_trials - tensor_pick_count + basis_generalization_count, max_tasks, infer_task_dist))
+	basis_val = float(expected_discounted_reward(basis_true_b0, basis_true_b1, infer_V, infer_P, gamma, basis_pick_count + basis_generalization_count, num_trials - tensor_pick_count + basis_generalization_count, max_tasks, infer_task_dist))
 	
 	# recompute expected tensor reward value -- infer_P = 0 since you're parallelizing the execution
 	tensor_val = float(expected_discounted_reward(t_reg.rx2('coefficients')[0], t_reg.rx2('coefficients')[1], infer_V, 0, gamma, tensor_pick_count + tensor_generalization_count, num_trials - basis_pick_count + tensor_generalization_count, max_tasks, infer_task_dist))
+	tensor_val = float(expected_discounted_reward(tensor_true_b0, tensor_true_b1, infer_V, 0, gamma, tensor_pick_count + tensor_generalization_count, num_trials - basis_pick_count + tensor_generalization_count, max_tasks, infer_task_dist))
 
 print("%d,%d" % (tensor_pick_count, basis_pick_count))
 print(choices)

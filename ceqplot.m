@@ -1,3 +1,5 @@
+%% regular
+
 N = 30;
 tau = 100;
 dg = 0.01;
@@ -6,7 +8,7 @@ gstart = 0.6;
 f = @(x, a, c) 1./(1 + exp(-a.*(x-c)));
 
 t_b = 20;
-t_t = 40;
+t_t = 150;
 
 data = zeros(N, size(gstart:dg:1, 2));
 
@@ -30,14 +32,14 @@ for n = 1:N
 end
 
 
-figure;
-surf(gstart:dg:1, 1:N, data, 'FaceColor', [1.0 0.27 0]);
+hold on;
+surf(gstart:dg:1, 1:N, data, 'FaceColor', [0.8 0.27 0.15]);
 ylabel('N', 'FontSize', 12);
 xlabel('\gamma', 'FontSize', 18);
 zlabel('C_{eq}', 'FontSize', 12);
 zlim([0 5]);
 
-%%
+%% EVC
 
 N = 30;
 tau = 100;
